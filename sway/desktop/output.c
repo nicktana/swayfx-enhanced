@@ -1,3 +1,4 @@
+#include <string.h>
 #include <assert.h>
 #include <stdlib.h>
 #include <strings.h>
@@ -284,6 +285,18 @@ void output_configure_scene(struct sway_output *output, struct wlr_scene_node *n
 			wlr_scene_shadow_set_blur_sigma(surface->shadow_node, config->shadow_blur_sigma);
 			wlr_scene_shadow_set_corner_radius(surface->shadow_node, surface->corner_radius);
 
+			/* Continuum authoritative blur region v6 */
+			if (strcmp(layer_surface->namespace, "continuum-glass-region") == 0 ||
+					strcmp(layer_surface->namespace, "continuum-glass-tile-region") == 0) {
+				/* Do not re-enable or resize region blur to the full buffer. */
+				if (getenv("CONTINUUM_REGION_TRACE") &&
+						strcmp(layer_surface->namespace, "continuum-glass-tile-region") == 0) {
+					struct wlr_scene_blur *bn = surface->blur_node;
+					sway_log(SWAY_INFO, "GLASS_TILE_RENDER enabled=%d x=%d y=%d w=%d h=%d",
+						bn->node.enabled, bn->node.x, bn->node.y, bn->width, bn->height);
+				}
+				return;
+			}
 			wlr_scene_node_set_enabled(&surface->blur_node->node, surface->blur_enabled);
 
 			if (surface->blur_enabled) {

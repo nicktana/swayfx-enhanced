@@ -82,6 +82,116 @@ static void layer_parse_criteria(struct sway_layer_surface *surface) {
 	layer_apply_criteria(surface, criteria);
 }
 
+/* Continuum region bridge v1 */
+/* Experimental opt-in: the rectangular input mask doubles as the optical
+ * bounds. It is not a general-purpose glass protocol. Other namespaces keep
+ * their upstream behavior. Coordinates are logical surface-local pixels. */
+static bool continuum_region_surface(struct sway_layer_surface *s) {
+    return strcmp(s->layer_surface->namespace, "continuum-glass-region") == 0 ||
+        strcmp(s->layer_surface->namespace, "continuum-glass-tile-region") == 0;
+}
+
+static void continuum_update_region(struct sway_layer_surface *s, bool refresh_material) {
+    struct wlr_surface *wl = s->layer_surface->surface;
+    struct wlr_box b = {0};
+    if (wl->mapped && wl->current.width > 0 && wl->current.height > 0 &&
+            pixman_region32_not_empty(&wl->current.input)) {
+        const pixman_box32_t *e = pixman_region32_extents(&wl->current.input);
+        /* Clip before subtracting, including the default unbounded input region. */
+        int left = e->x1 < 0 ? 0 : e->x1;
+        int top = e->y1 < 0 ? 0 : e->y1;
+        int right = e->x2 > wl->current.width ? wl->current.width : e->x2;
+        int bottom = e->y2 > wl->current.height ? wl->current.height : e->y2;
+        if (right > left && bottom > top) {
+            b = (struct wlr_box){ .x = left, .y = top,
+                .width = right - left, .height = bottom - top };
+        }
+    }
+    /* Continuum tile hidden marker v3 */
+    /* QML reserves a nonempty 1x1 mask for the hidden phase; it never
+     * requests visible tile regions smaller than 3x3 logical pixels. */
+    bool is_tile = strcmp(s->layer_surface->namespace,
+        "continuum-glass-tile-region") == 0;
+    /* Continuum tile padded canvas guard v4 */
+    /* Real tile masks leave two transparent pixels on right and bottom.
+     * Reject the default unrestricted region even on the first map commit. */
+    bool valid = b.width > 0 && b.height > 0 &&
+        (!is_tile || (b.width > 2 && b.height > 2 &&
+            b.x + b.width <= wl->current.width - 2 &&
+            b.y + b.height <= wl->current.height - 2));
+    bool glass = valid && s->liquid_glass_enabled;
+    bool blur = valid && s->blur_enabled;
+    bool shadow = valid && s->shadow_enabled;
+    if (!glass) wlr_scene_node_set_enabled(&s->liquid_glass_node->node, false);
+    if (!blur) wlr_scene_node_set_enabled(&s->blur_node->node, false);
+    if (!shadow) wlr_scene_node_set_enabled(&s->shadow_node->node, false);
+    if (getenv("CONTINUUM_REGION_TRACE") &&
+            strcmp(s->layer_surface->namespace, "continuum-glass-tile-region") == 0) {
+        sway_log(SWAY_INFO, "GLASS_TILE_REGION x=%d y=%d w=%d h=%d blur=%d canvas=%dx%d",
+            b.x, b.y, b.width, b.height, blur, wl->current.width, wl->current.height);
+    }
+    if (!valid) return;
+    if (glass) {
+        struct wlr_scene_liquid_glass *g = s->liquid_glass_node;
+        bool changed = g->node.x != b.x || g->node.y != b.y ||
+            g->width != b.width || g->height != b.height;
+        wlr_scene_node_set_position(&g->node, b.x, b.y);
+        wlr_scene_liquid_glass_set_size(g, b.width, b.height);
+        if (refresh_material) wlr_scene_liquid_glass_set_data(g, config->liquid_glass_data);
+        int radius = s->corner_radius;
+        if (radius > b.width / 2) radius = b.width / 2;
+        if (radius > b.height / 2) radius = b.height / 2;
+        wlr_scene_liquid_glass_set_clipped_region(g, (struct clipped_region){
+            .area = { .width = b.width, .height = b.height },
+            .corners = corner_radii_all(radius),
+        });
+        wlr_scene_node_set_enabled(&g->node, true);
+        if (changed && getenv("CONTINUUM_REGION_TRACE")) {
+            sway_log(SWAY_INFO, "GLASS_REGION x=%d y=%d w=%d h=%d canvas=%dx%d",
+                b.x, b.y, b.width, b.height, wl->current.width, wl->current.height);
+        }
+    }
+    if (blur) {
+        /* Continuum authoritative blur region v6 */
+        struct wlr_scene_blur *bn = s->blur_node;
+        int radius = s->corner_radius;
+        if (radius > b.width / 2) radius = b.width / 2;
+        if (radius > b.height / 2) radius = b.height / 2;
+        wlr_scene_node_set_position(&bn->node, b.x, b.y);
+        wlr_scene_blur_set_size(bn, b.width, b.height);
+        wlr_scene_blur_set_corner_radii(bn, corner_radii_all(radius));
+        wlr_scene_blur_set_should_only_blur_bottom_layer(bn, s->blur_xray);
+        wlr_scene_blur_set_transparency_mask_source(bn, NULL);
+        /* Fade the actual optical effect during the first half of tile growth.
+         * At full size retain the exact existing material strength. */
+        float alpha = 1.0f;
+        if (is_tile && wl->current.width > 2 && wl->current.height > 2) {
+            float x = (float)b.width / (wl->current.width - 2);
+            float y = (float)b.height / (wl->current.height - 2);
+            float t = (x < y ? x : y) * 2.0f;
+            if (t > 1.0f) t = 1.0f;
+            if (t < 0.0f) t = 0.0f;
+            alpha = t * t * (3.0f - 2.0f * t);
+        }
+        wlr_scene_blur_set_alpha(bn, alpha);
+        wlr_scene_blur_set_strength(bn, alpha);
+        wlr_scene_node_set_enabled(&bn->node, true);
+    }
+    if (shadow) {
+        int dx = config->shadow_offset_x - config->shadow_blur_sigma;
+        int dy = config->shadow_offset_y - config->shadow_blur_sigma;
+        wlr_scene_node_set_position(&s->shadow_node->node, b.x + dx, b.y + dy);
+        wlr_scene_shadow_set_size(s->shadow_node,
+            b.width + config->shadow_blur_sigma * 2,
+            b.height + config->shadow_blur_sigma * 2);
+        wlr_scene_shadow_set_clipped_region(s->shadow_node, (struct clipped_region){
+            .corners = corner_radii_all(s->corner_radius),
+            .area = { .x = -dx, .y = -dy, .width = b.width, .height = b.height },
+        });
+        wlr_scene_node_set_enabled(&s->shadow_node->node, true);
+    }
+}
+
 static void arrange_surface(struct sway_output *output, const struct wlr_box *full_area,
 		struct wlr_box *usable_area, struct wlr_scene_tree *tree, bool exclusive) {
 	struct wlr_scene_node *node;
@@ -101,6 +211,9 @@ static void arrange_surface(struct sway_output *output, const struct wlr_box *fu
 			continue;
 		}
 
+		if (continuum_region_surface(surface)) {
+			continuum_update_region(surface, true);
+		} else {
 		wlr_scene_node_set_enabled(&surface->blur_node->node, surface->blur_enabled);
 		wlr_scene_blur_set_size(surface->blur_node, surface->layer_surface->surface->current.width,
 			surface->layer_surface->surface->current.height);
@@ -163,6 +276,8 @@ static void arrange_surface(struct sway_output *output, const struct wlr_box *fu
 						.height = surface->layer_surface->surface->current.height,
 					},
 			});
+		}
+
 		}
 
 		wlr_scene_layer_surface_v1_configure(surface->scene, full_area, usable_area);
@@ -417,6 +532,9 @@ static void handle_surface_commit(struct wl_listener *listener, void *data) {
 		arrange_layers(surface->output);
 		transaction_commit_dirty();
 	}
+	if (continuum_region_surface(surface)) {
+		continuum_update_region(surface, false);
+	}
 }
 
 static void handle_map(struct wl_listener *listener, void *data) {
@@ -430,6 +548,9 @@ static void handle_map(struct wl_listener *listener, void *data) {
 				surface->scene->layer_surface;
 
 	layer_parse_criteria(surface);
+	if (continuum_region_surface(surface)) {
+		continuum_update_region(surface, true);
+	}
 	wlr_scene_node_lower_to_bottom(&surface->shadow_node->node);
 	wlr_scene_node_lower_to_bottom(&surface->blur_node->node);
 	wlr_scene_node_lower_to_bottom(&surface->liquid_glass_node->node);
